@@ -1,5 +1,25 @@
 # Changelog — 豆包浮動待辦
 
+## v3.0.1 — 修閃動（卡片 hover ＋ 浮動頭）
+
+視覺同行為維持 v3.0 Dusk Ledger，只修 WinForms 閃白／閃爍。
+
+### 原因
+1. **卡片**：滑鼠經過 TextBox／Label 時父 Panel 不停 `MouseLeave`→`MouseEnter`；每次 hover 改一堆 `BackColor` 再 `Invalidate`，無雙緩衝就會閃。
+2. **浮動頭**：`TransparencyKey` 窗每次 `Invalidate` 先擦成洋紅（變透明空洞）再重畫；再加每幀 HighQuality 縮 256px PNG，look-at timer 幾乎唔停。
+
+### 修法
+- `SmoothPanel`：`OptimizedDoubleBuffer` + `WS_EX_COMPOSITED`，卡片同子控件一次合成。
+- Hover：子控件都接 Enter／Leave；Leave 時若游標仍在卡片內就唔取消 hover；狀態冇變就 return；唔再多餘 `Invalidate`。
+- `SpriteForm`：跳過 `OnPaintBackground`／`WM_ERASEBKGND`；Paint 內 `Clear(Magenta)` 一次畫完。**唔**對 color-key 窗開 double-buffer（反而會閃黑）。
+- 預縮 `ember_spirit_face.png` 到 52px cache；look-at 量化＋拖曳時唔跟眼；timer 20ms。
+- 面板／列表／header／footer 反射開 DoubleBuffered。
+
+### 點樣測（Windows）
+滑鼠喺卡片之間快速掃、停喺標題上、進出面板；滑過／離開浮動頭、眼睛跟隨、右鍵 bounce。應冇明顯閃白／內容跳動。
+
+---
+
 ## v3.0 — Dusk Ledger（暮色手帳）全面重設
 
 唔係換皮：色票、字級、間距、卡片結構、header 層次、按鈕形態、浮動角色全部重做。行為同 API 合約維持。

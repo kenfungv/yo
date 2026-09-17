@@ -1,9 +1,10 @@
 ﻿#Requires -Version 5.1
 param([switch]$Preview)
 <#
-  豆包浮動待辦 v3.0  Dusk Ledger（暮色手帳）
+  豆包浮動待辦 v3.0.1  Dusk Ledger（暮色手帳）
   設計：靛藍夜色畫布＋銅桃 ember 強調；日曆主視覺；票卡式日期軌
   浮動頭：Ember 暮火精靈（可動雙眼 look-at；右鍵 squash／bounce 後 Toggle-Panel）
+  v3.0.1：修卡片／浮動頭閃動（雙緩衝、hover 不抖、icon 唔擦底）
   左鍵開豆包／拖曳移動；GET secretary.kenfungv.workers.dev/api/todo7 ；Token: SECRETARY_TODO_TOKEN；唯讀
 #>
 
@@ -12,6 +13,65 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 try { [void][System.Windows.Forms.Application]::SetHighDpiMode('PerMonitorV2') } catch {}
 [void][System.Windows.Forms.Application]::EnableVisualStyles()
+
+# SmoothPanel: child-composite + double-buffer (card hover without flash)
+# SpriteForm: skip WM_ERASEBKGND (TransparencyKey icon without magenta flash)
+if (-not ('SmoothPanel' -as [type])) {
+    try {
+        Add-Type -ReferencedAssemblies @('System.Windows.Forms', 'System.Drawing') -TypeDefinition @'
+using System;
+using System.Windows.Forms;
+public class SmoothPanel : Panel {
+    public SmoothPanel() {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        UpdateStyles();
+        DoubleBuffered = true;
+    }
+    protected override CreateParams CreateParams {
+        get {
+            CreateParams cp = base.CreateParams;
+            cp.ExStyle |= 0x02000000; // WS_EX_COMPOSITED
+            return cp;
+        }
+    }
+}
+public class SpriteForm : Form {
+    public SpriteForm() {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                 ControlStyles.Opaque | ControlStyles.ResizeRedraw, true);
+        UpdateStyles();
+    }
+    protected override void OnPaintBackground(PaintEventArgs e) { }
+}
+'@
+    } catch {}
+}
+
+function New-CardHost {
+    if ('SmoothPanel' -as [type]) { return New-Object SmoothPanel }
+    $p = New-Object System.Windows.Forms.Panel
+    Enable-DoubleBuffer $p
+    return $p
+}
+
+function New-LogoHost {
+    if ('SpriteForm' -as [type]) { return New-Object SpriteForm }
+    return New-Object System.Windows.Forms.Form
+}
+
+function Enable-DoubleBuffer($ctrl) {
+    try {
+        $flags = [System.Reflection.BindingFlags]([System.Reflection.BindingFlags]::Instance -bor [System.Reflection.BindingFlags]::NonPublic)
+        $prop = $ctrl.GetType().GetProperty('DoubleBuffered', $flags)
+        if ($prop) { $prop.SetValue($ctrl, $true, $null) }
+        $mi = $ctrl.GetType().GetMethod('SetStyle', $flags)
+        if ($mi) {
+            $st = [System.Windows.Forms.ControlStyles]::AllPaintingInWmPaint -bor [System.Windows.Forms.ControlStyles]::OptimizedDoubleBuffer
+            $mi.Invoke($ctrl, @($st, $true))
+        }
+    } catch {}
+}
 
 $DoubaoExe = 'C:\Users\User\AppData\Local\Doubao\Application\Doubao.exe'
 $ApiUrl    = 'https://secretary.kenfungv.workers.dev/api/todo7'
@@ -91,6 +151,7 @@ function Set-RoundedRegion($ctrl, [int]$r) {
 
 # Ember spirit avatar (256px face space; matches assets/ember_spirit_face.png)
 $script:faceBmp = $null
+$script:faceCache = $null
 $script:lookX = 0.0; $script:lookY = 0.0
 $script:lookTX = 0.0; $script:lookTY = 0.0
 $script:hovering = $false
@@ -119,6 +180,16 @@ function Import-AvatarFace {
         $tmp = [System.Drawing.Bitmap]::FromStream($ms)
         $script:faceBmp = New-Object System.Drawing.Bitmap($tmp)
         $tmp.Dispose(); $ms.Dispose()
+        if ($script:faceCache) { try { $script:faceCache.Dispose() } catch {} }
+        $disc = 52
+        $script:faceCache = New-Object System.Drawing.Bitmap($disc, $disc, [System.Drawing.Imaging.PixelFormat]::Format32bppPArgb)
+        $cg = [System.Drawing.Graphics]::FromImage($script:faceCache)
+        $cg.Clear([System.Drawing.Color]::Transparent)
+        $cg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $cg.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $cg.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $cg.DrawImage($script:faceBmp, 0, 0, $disc, $disc)
+        $cg.Dispose()
     } catch {}
 }
 
@@ -158,13 +229,19 @@ function Set-LookAt([int]$mx, [int]$my) {
     $len = [Math]::Sqrt(($dx * $dx) + ($dy * $dy))
     $max = 4.4
     if ($len -lt 0.8) {
-        $script:lookTX = 0.0
-        $script:lookTY = 0.0
+        $tx = 0.0
+        $ty = 0.0
     } else {
         $mag = [Math]::Min($max, $len * 0.18)
-        $script:lookTX = ($dx / $len) * $mag
-        $script:lookTY = ($dy / $len) * $mag
+        $tx = ($dx / $len) * $mag
+        $ty = ($dy / $len) * $mag
     }
+    $q = 0.35
+    $tx = [Math]::Round($tx / $q) * $q
+    $ty = [Math]::Round($ty / $q) * $q
+    if (([Math]::Abs($tx - [double]$script:lookTX) + [Math]::Abs($ty - [double]$script:lookTY)) -lt 0.05) { return }
+    $script:lookTX = $tx
+    $script:lookTY = $ty
     Start-AvatarAnim
 }
 
@@ -216,7 +293,11 @@ function Draw-EmberSpirit([System.Drawing.Graphics]$g) {
     $under = Get-Brush $cSpiritUnder
     $g.FillEllipse($under, $ox, $oy, $disc, $disc); $under.Dispose()
     $faceW = 256.0
-    if ($null -ne $script:faceBmp) {
+    if ($null -ne $script:faceCache) {
+        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::NearestNeighbor
+        $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::Half
+        $g.DrawImage($script:faceCache, $ox, $oy, $disc, $disc)
+    } elseif ($null -ne $script:faceBmp) {
         $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
         $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
         $g.DrawImage($script:faceBmp, $ox, $oy, $disc, $disc)
@@ -366,16 +447,50 @@ function New-CardContextMenu($card) {
 
 function Set-CardHover($card, [bool]$hover) {
     $tag = $card.Tag
+    if ($null -eq $tag) { return }
+    if ([bool]$tag.Hover -eq $hover) { return }
     $tag.Hover = $hover
     $bg = if ($hover) { $tag.WashHover } else { $tag.Wash }
-    $card.BackColor = $bg
-    foreach ($ctl in $card.Controls) {
-        if ($tag.MarkerLbl -and [object]::ReferenceEquals($ctl, $tag.MarkerLbl)) { continue }
-        if ($ctl -is [System.Windows.Forms.TextBox] -or $ctl -is [System.Windows.Forms.Label]) {
-            $ctl.BackColor = $bg
+    $card.SuspendLayout()
+    try {
+        $card.BackColor = $bg
+        foreach ($ctl in $card.Controls) {
+            if ($tag.MarkerLbl -and [object]::ReferenceEquals($ctl, $tag.MarkerLbl)) { continue }
+            if ($ctl -is [System.Windows.Forms.TextBox] -or $ctl -is [System.Windows.Forms.Label]) {
+                $ctl.BackColor = $bg
+            }
         }
+    } finally {
+        $card.ResumeLayout($false)
     }
-    $card.Invalidate()
+}
+
+function Get-HoverCard($ctrl) {
+    $c = $ctrl
+    while ($null -ne $c) {
+        if ($c.Tag -is [hashtable] -and $c.Tag.ContainsKey('Wash')) { return $c }
+        $c = $c.Parent
+    }
+    return $null
+}
+
+function Connect-CardHover($card) {
+    $onEnter = {
+        $c = Get-HoverCard $this
+        if ($c) { Set-CardHover $c $true }
+    }
+    $onLeave = {
+        $c = Get-HoverCard $this
+        if (-not $c) { return }
+        $pt = $c.PointToClient([System.Windows.Forms.Cursor]::Position)
+        if (-not $c.ClientRectangle.Contains($pt)) { Set-CardHover $c $false }
+    }
+    $card.Add_MouseEnter($onEnter)
+    $card.Add_MouseLeave($onLeave)
+    foreach ($ch in $card.Controls) {
+        $ch.Add_MouseEnter($onEnter)
+        $ch.Add_MouseLeave($onLeave)
+    }
 }
 
 function Toggle-Card($card) {
@@ -433,7 +548,7 @@ function New-GroupHeader([string]$name, [int]$count, [System.Drawing.Color]$acce
 
 function New-TodoCard {
     param($item)
-    $card = New-Object System.Windows.Forms.Panel
+    $card = New-CardHost
     $card.Width = $CardW; $card.Height = $CardBaseH; $card.BackColor = $item.Wash
     $tag = @{
         Expanded = $false; Color = $item.Color; Hover = $false
@@ -500,9 +615,8 @@ function New-TodoCard {
         $g.DrawLine($pen, 52, 12, 52, ($h - 12))
         $pen.Dispose(); $body.Dispose()
     })
-    $card.Add_MouseEnter({ Set-CardHover $this $true })
-    $card.Add_MouseLeave({ Set-CardHover $this $false })
     $card.Add_DoubleClick({ Toggle-Card $this })
+    Connect-CardHover $card
     return $card
 }
 
@@ -628,7 +742,7 @@ function Launch-Doubao {
     }
 }
 
-$logo = New-Object System.Windows.Forms.Form
+$logo = New-LogoHost
 $logo.FormBorderStyle = 'None'
 $logo.StartPosition = 'Manual'
 $logo.ShowInTaskbar = $false
@@ -645,7 +759,7 @@ $logo.Add_Paint({
     param($s, $e)
     $g = $e.Graphics
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $g.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+    $g.Clear($cKey)
     $xf = @{ Sx = 1.0; Sy = 1.0; Oy = 0.0 }
     if ($script:bouncing) { $xf = Get-BounceXform ([double]$script:bounceT) }
     $cx = $LogoSize / 2.0
@@ -669,6 +783,7 @@ $logo.Add_MouseMove({
         $dx = $e.X - $script:dragStart.X; $dy = $e.Y - $script:dragStart.Y
         if ([Math]::Abs($dx) + [Math]::Abs($dy) -gt 4) { $script:dragging = $true }
         if ($script:dragging) { $logo.Location = New-Object System.Drawing.Point(($logo.Left + $dx), ($logo.Top + $dy)) }
+        return
     }
     $script:hovering = $true
     Set-LookAt $e.X $e.Y
@@ -696,12 +811,12 @@ $tip = New-Object System.Windows.Forms.ToolTip
 $tip.SetToolTip($logo, "左鍵：開豆包`n右鍵：彈跳後開 7 日待辦`n拖曳：移動`n懸停：眼睛跟隨`n面板可選取／Ctrl+C／右鍵複製")
 
 $script:animTimer = New-Object System.Windows.Forms.Timer
-$script:animTimer.Interval = 16
+$script:animTimer.Interval = 20
 $script:animTimer.Add_Tick({
     $dirty = $false
     $doToggle = $false
     if ($script:bouncing) {
-        $script:bounceT = [double]$script:bounceT + 0.058
+        $script:bounceT = [double]$script:bounceT + 0.07
         $dirty = $true
         if ($script:bounceT -ge 1.0) {
             $script:bounceT = 0.0
@@ -730,6 +845,7 @@ $script:animTimer.Add_Tick({
 })
 $logo.Add_FormClosed({
     if ($script:animTimer) { try { $script:animTimer.Stop(); $script:animTimer.Dispose() } catch {} }
+    if ($script:faceCache) { try { $script:faceCache.Dispose() } catch {}; $script:faceCache = $null }
     if ($script:faceBmp) { try { $script:faceBmp.Dispose() } catch {}; $script:faceBmp = $null }
 })
 
@@ -749,11 +865,13 @@ $path.AddArc(($PanelW - $d), ($PanelH - $d), $d, $d, 0, 90)
 $path.AddArc(0, ($PanelH - $d), $d, $d, 90, 90)
 $path.CloseFigure()
 $panel.Region = New-Object System.Drawing.Region($path)
+Enable-DoubleBuffer $panel
 
 $header = New-Object System.Windows.Forms.Panel
 $header.Location = New-Object System.Drawing.Point(0, 0)
 $header.Size = New-Object System.Drawing.Size($PanelW, $HeaderH)
 $header.BackColor = $cBg
+Enable-DoubleBuffer $header
 $header.Add_Paint({
     param($s, $e)
     $g = $e.Graphics
@@ -820,12 +938,14 @@ $listPanel.BackColor = $cBg
 $listPanel.AutoScroll = $true
 $listPanel.HorizontalScroll.Enabled = $false
 $listPanel.HorizontalScroll.Visible = $false
+Enable-DoubleBuffer $listPanel
 $panel.Controls.Add($listPanel)
 
 $footer = New-Object System.Windows.Forms.Panel
 $footer.BackColor = $cBg
 $footer.Location = New-Object System.Drawing.Point(0, ($PanelH - $FooterH))
 $footer.Size = New-Object System.Drawing.Size($PanelW, $FooterH)
+Enable-DoubleBuffer $footer
 $footer.Add_Paint({
     param($s, $e)
     $pen = New-Object System.Drawing.Pen($cBorder, 1)
