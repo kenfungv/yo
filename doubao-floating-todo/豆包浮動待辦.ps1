@@ -1,10 +1,10 @@
 ﻿#Requires -Version 5.1
 param([switch]$Preview)
 <#
-  豆包浮動待辦 v3.0.1  Dusk Ledger（暮色手帳）
+  豆包浮動待辦 v3.0.2  Dusk Ledger（暮色手帳）
   設計：靛藍夜色畫布＋銅桃 ember 強調；日曆主視覺；票卡式日期軌
   浮動頭：Ember 暮火精靈（可動雙眼 look-at；右鍵 squash／bounce 後 Toggle-Panel）
-  v3.0.1：修卡片／浮動頭閃動（雙緩衝、hover 不抖、icon 唔擦底）
+  v3.0.2：layered 頭像防閃；列表內層 canvas 修滾到頂空白
   左鍵開豆包／拖曳移動；GET secretary.kenfungv.workers.dev/api/todo7 ；Token: SECRETARY_TODO_TOKEN；唯讀
 #>
 
@@ -14,8 +14,8 @@ Add-Type -AssemblyName System.Drawing
 try { [void][System.Windows.Forms.Application]::SetHighDpiMode('PerMonitorV2') } catch {}
 [void][System.Windows.Forms.Application]::EnableVisualStyles()
 
-# SmoothPanel: child-composite + double-buffer (card hover without flash)
-# SpriteForm: skip WM_ERASEBKGND (TransparencyKey icon without magenta flash)
+# SmoothPanel: child-composite + double-buffer (card hover)
+# LayeredForm: UpdateLayeredWindow per-pixel alpha (no TransparencyKey / Invalidate flicker)
 if (-not ('SmoothPanel' -as [type])) {
     try {
         Add-Type -ReferencedAssemblies @('System.Windows.Forms', 'System.Drawing') -TypeDefinition @'
@@ -31,18 +31,128 @@ public class SmoothPanel : Panel {
     protected override CreateParams CreateParams {
         get {
             CreateParams cp = base.CreateParams;
-            cp.ExStyle |= 0x02000000; // WS_EX_COMPOSITED
+            cp.ExStyle |= 0x02000000;
             return cp;
         }
     }
 }
-public class SpriteForm : Form {
-    public SpriteForm() {
+'@
+    } catch {}
+}
+if (-not ('LayeredForm' -as [type])) {
+    try {
+        Add-Type -ReferencedAssemblies @('System.Windows.Forms', 'System.Drawing') -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public class LayeredForm : Form {
+    public const int WS_EX_LAYERED = 0x80000;
+    public const int WS_EX_TOOLWINDOW = 0x80;
+    public const int ULW_ALPHA = 0x02;
+    public const int GWL_EXSTYLE = -20;
+    public const int WM_ERASEBKGND = 0x0014;
+    public const byte AC_SRC_OVER = 0x00;
+    public const byte AC_SRC_ALPHA = 0x01;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int X; public int Y; public POINT(int x, int y) { X = x; Y = y; } }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SIZE { public int cx; public int cy; public SIZE(int w, int h) { cx = w; cy = h; } }
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public struct BLENDFUNCTION {
+        public byte BlendOp; public byte BlendFlags; public byte SourceConstantAlpha; public byte AlphaFormat;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, IntPtr pptDst, ref SIZE psize,
+        IntPtr hdcSrc, ref POINT pptSrc, int crKey, ref BLENDFUNCTION pblend, int dwFlags);
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+    [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr hDC);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr hDC, IntPtr hObject);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr hObject);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr hdc);
+
+    public LayeredForm() {
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.Manual;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
                  ControlStyles.Opaque | ControlStyles.ResizeRedraw, true);
         UpdateStyles();
     }
+    protected override CreateParams CreateParams {
+        get {
+            CreateParams cp = base.CreateParams;
+            cp.ExStyle |= WS_EX_LAYERED | WS_EX_TOOLWINDOW;
+            return cp;
+        }
+    }
+    protected override void OnHandleCreated(EventArgs e) {
+        base.OnHandleCreated(e);
+        int ex = GetWindowLong(this.Handle, GWL_EXSTYLE);
+        if ((ex & WS_EX_LAYERED) == 0)
+            SetWindowLong(this.Handle, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+    }
+    protected override void OnPaint(PaintEventArgs e) { }
     protected override void OnPaintBackground(PaintEventArgs e) { }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == WM_ERASEBKGND) { m.Result = (IntPtr)1; return; }
+        base.WndProc(ref m);
+    }
+
+    public void SetLayeredBitmap(Bitmap src) {
+        if (!IsHandleCreated || src == null) return;
+        Bitmap bmp = new Bitmap(src.Width, src.Height, PixelFormat.Format32bppArgb);
+        using (Graphics g = Graphics.FromImage(bmp)) {
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.DrawImageUnscaled(src, 0, 0);
+        }
+        Premultiply(bmp);
+        IntPtr screenDc = GetDC(IntPtr.Zero);
+        IntPtr memDc = CreateCompatibleDC(screenDc);
+        IntPtr hBmp = IntPtr.Zero;
+        IntPtr old = IntPtr.Zero;
+        try {
+            hBmp = bmp.GetHbitmap(Color.FromArgb(0));
+            old = SelectObject(memDc, hBmp);
+            SIZE size = new SIZE(bmp.Width, bmp.Height);
+            POINT srcPt = new POINT(0, 0);
+            BLENDFUNCTION blend = new BLENDFUNCTION();
+            blend.BlendOp = AC_SRC_OVER;
+            blend.SourceConstantAlpha = 255;
+            blend.AlphaFormat = AC_SRC_ALPHA;
+            UpdateLayeredWindow(this.Handle, screenDc, IntPtr.Zero, ref size, memDc, ref srcPt, 0, ref blend, ULW_ALPHA);
+        } finally {
+            if (hBmp != IntPtr.Zero) { SelectObject(memDc, old); DeleteObject(hBmp); }
+            DeleteDC(memDc);
+            ReleaseDC(IntPtr.Zero, screenDc);
+            bmp.Dispose();
+        }
+    }
+
+    static void Premultiply(Bitmap bmp) {
+        BitmapData data = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height),
+            ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+        int len = Math.Abs(data.Stride) * bmp.Height;
+        byte[] bits = new byte[len];
+        Marshal.Copy(data.Scan0, bits, 0, len);
+        for (int i = 0; i + 3 < bits.Length; i += 4) {
+            int a = bits[i + 3];
+            if (a == 255 || a == 0) continue;
+            bits[i]     = (byte)(bits[i] * a / 255);
+            bits[i + 1] = (byte)(bits[i + 1] * a / 255);
+            bits[i + 2] = (byte)(bits[i + 2] * a / 255);
+        }
+        Marshal.Copy(bits, 0, data.Scan0, len);
+        bmp.UnlockBits(data);
+    }
 }
 '@
     } catch {}
@@ -56,8 +166,15 @@ function New-CardHost {
 }
 
 function New-LogoHost {
-    if ('SpriteForm' -as [type]) { return New-Object SpriteForm }
-    return New-Object System.Windows.Forms.Form
+    if ('LayeredForm' -as [type]) { return New-Object LayeredForm }
+    $f = New-Object System.Windows.Forms.Form
+    $f.FormBorderStyle = 'None'
+    $f.ShowInTaskbar = $false
+    return $f
+}
+
+function Test-LayeredLogo {
+    return ($null -ne $logo -and ('LayeredForm' -as [type]) -and $logo -is [LayeredForm])
 }
 
 function Enable-DoubleBuffer($ctrl) {
@@ -101,7 +218,6 @@ $cChipOverdue  = [System.Drawing.Color]::FromArgb(72, 36, 42)
 $cChipToday    = [System.Drawing.Color]::FromArgb(72, 48, 36)
 $cChipSoon     = [System.Drawing.Color]::FromArgb(68, 56, 36)
 $cChipLater    = [System.Drawing.Color]::FromArgb(40, 44, 56)
-$cKey          = [System.Drawing.Color]::Magenta
 $cSpiritUnder  = [System.Drawing.Color]::FromArgb(48, 42, 62)
 
 $PanelW = 408; $PanelH = 528; $HeaderH = 92; $FooterH = 52
@@ -152,6 +268,8 @@ function Set-RoundedRegion($ctrl, [int]$r) {
 # Ember spirit avatar (256px face space; matches assets/ember_spirit_face.png)
 $script:faceBmp = $null
 $script:faceCache = $null
+$script:baseSprite = $null
+$script:logoFrame = $null
 $script:lookX = 0.0; $script:lookY = 0.0
 $script:lookTX = 0.0; $script:lookTY = 0.0
 $script:hovering = $false
@@ -236,10 +354,10 @@ function Set-LookAt([int]$mx, [int]$my) {
         $tx = ($dx / $len) * $mag
         $ty = ($dy / $len) * $mag
     }
-    $q = 0.35
+    $q = 0.70
     $tx = [Math]::Round($tx / $q) * $q
     $ty = [Math]::Round($ty / $q) * $q
-    if (([Math]::Abs($tx - [double]$script:lookTX) + [Math]::Abs($ty - [double]$script:lookTY)) -lt 0.05) { return }
+    if (([Math]::Abs($tx - [double]$script:lookTX) + [Math]::Abs($ty - [double]$script:lookTY)) -lt 0.2) { return }
     $script:lookTX = $tx
     $script:lookTY = $ty
     Start-AvatarAnim
@@ -286,13 +404,12 @@ function Draw-EmberFallback {
     $smilePen.Dispose()
 }
 
-function Draw-EmberSpirit([System.Drawing.Graphics]$g) {
+function Draw-EmberFace([System.Drawing.Graphics]$g) {
     $ox = 6; $oy = 5; $disc = 52
     $sh = Get-Brush ([System.Drawing.Color]::FromArgb(90, 0, 0, 0))
     $g.FillEllipse($sh, 10, 12, 46, 46); $sh.Dispose()
     $under = Get-Brush $cSpiritUnder
     $g.FillEllipse($under, $ox, $oy, $disc, $disc); $under.Dispose()
-    $faceW = 256.0
     if ($null -ne $script:faceCache) {
         $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::NearestNeighbor
         $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::Half
@@ -301,10 +418,17 @@ function Draw-EmberSpirit([System.Drawing.Graphics]$g) {
         $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
         $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
         $g.DrawImage($script:faceBmp, $ox, $oy, $disc, $disc)
-        $faceW = [double]$script:faceBmp.Width
     } else {
         Draw-EmberFallback $g $ox $oy $disc
     }
+    $ring = New-Object System.Drawing.Pen($cAccent, 1.7)
+    $g.DrawEllipse($ring, $ox, $oy, $disc, $disc)
+    $ring.Dispose()
+}
+
+function Draw-EmberPupils([System.Drawing.Graphics]$g) {
+    $ox = 6; $oy = 5; $disc = 52
+    $faceW = 256.0
     $scale = $disc / $faceW
     $pr = $script:pupilR * $scale
     foreach ($eye in $script:eyes) {
@@ -331,12 +455,76 @@ function Draw-EmberSpirit([System.Drawing.Graphics]$g) {
         $g.ResetClip()
         $clip.Dispose()
     }
-    $ring = New-Object System.Drawing.Pen($cAccent, 1.7)
-    $g.DrawEllipse($ring, $ox, $oy, $disc, $disc)
-    $ring.Dispose()
+}
+
+function Draw-EmberSpirit([System.Drawing.Graphics]$g) {
+    Draw-EmberFace $g
+    Draw-EmberPupils $g
+}
+
+function New-LogoBitmap {
+    $bmp = New-Object System.Drawing.Bitmap($LogoSize, $LogoSize, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceOver
+    $g.Clear([System.Drawing.Color]::Transparent)
+    $xf = @{ Sx = 1.0; Sy = 1.0; Oy = 0.0 }
+    if ($script:bouncing) { $xf = Get-BounceXform ([double]$script:bounceT) }
+    $cx = $LogoSize / 2.0
+    $cy = $LogoSize / 2.0
+    $state = $g.Save()
+    $g.TranslateTransform([single]$cx, [single]($cy + $xf.Oy))
+    $g.ScaleTransform([single]$xf.Sx, [single]$xf.Sy)
+    $g.TranslateTransform([single](-$cx), [single](-$cy))
+    Draw-EmberSpirit $g
+    $g.Restore($state)
+    $g.Dispose()
+    return $bmp
+}
+
+function Build-BaseSprite {
+    $savedX = $script:lookX; $savedY = $script:lookY
+    $script:lookX = 0.0; $script:lookY = 0.0
+    $wasBounce = $script:bouncing
+    $script:bouncing = $false
+    $tmpT = $script:bounceT
+    $script:bounceT = 0.0
+    $bmp = New-Object System.Drawing.Bitmap($LogoSize, $LogoSize, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.Clear([System.Drawing.Color]::Transparent)
+    Draw-EmberFace $g
+    $g.Dispose()
+    if ($script:baseSprite) { try { $script:baseSprite.Dispose() } catch {} }
+    $script:baseSprite = $bmp
+    $script:lookX = $savedX; $script:lookY = $savedY
+    $script:bouncing = $wasBounce
+    $script:bounceT = $tmpT
+}
+
+function Publish-LogoFrame {
+    $bmp = $null
+    if (-not $script:bouncing -and $null -ne $script:baseSprite) {
+        $bmp = New-Object System.Drawing.Bitmap($script:baseSprite)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceOver
+        Draw-EmberPupils $g
+        $g.Dispose()
+    } else {
+        $bmp = New-LogoBitmap
+    }
+    if ((Test-LayeredLogo) -and $logo.IsHandleCreated) {
+        try { $logo.SetLayeredBitmap($bmp) } catch {}
+    } elseif ($null -ne $logo -and $logo.IsHandleCreated) {
+        try { $logo.Invalidate() } catch {}
+    }
+    if ($script:logoFrame) { try { $script:logoFrame.Dispose() } catch {} }
+    $script:logoFrame = $bmp
 }
 
 Import-AvatarFace
+Build-BaseSprite
 
 $fetchScript = {
     param($url, $token)
@@ -493,6 +681,32 @@ function Connect-CardHover($card) {
     }
 }
 
+function Set-ListCanvasHeight([int]$h) {
+    if (-not $listCanvas -or -not $listPanel) { return }
+    $h = [Math]::Max(8, $h)
+    $listCanvas.Width = $CardW
+    $listCanvas.Height = $h
+    # Virtual size = canvas height (not child.Bottom while scrolled — that shrinks the range and leaves a top gap).
+    $listPanel.AutoScrollMinSize = New-Object System.Drawing.Size(0, $h)
+}
+
+function Reset-ListContent {
+    if ($script:listRows) { $script:listRows.Clear() }
+    $script:cards.Clear()
+    if ($listPanel) { $listPanel.SuspendLayout() }
+    if ($listCanvas) {
+        $listCanvas.SuspendLayout()
+        $listCanvas.Controls.Clear()
+        Set-ListCanvasHeight 8
+        $listCanvas.ResumeLayout($false)
+    }
+    if ($listPanel) {
+        try { $listPanel.AutoScrollPosition = New-Object System.Drawing.Point(0, 0) } catch {}
+        if ($listCanvas) { $listCanvas.Location = New-Object System.Drawing.Point(0, 0) }
+        $listPanel.ResumeLayout($false)
+    }
+}
+
 function Toggle-Card($card) {
     $tag = $card.Tag
     $tag.Expanded = -not $tag.Expanded
@@ -515,9 +729,25 @@ function Toggle-Card($card) {
 }
 
 function Layout-Cards {
-    $y = 6
-    foreach ($c in $script:listRows) { $c.Top = $y; $y += $c.Height + 8 }
-    $listPanel.AutoScrollMinSize = New-Object System.Drawing.Size(0, ($y + 6))
+    if (-not $listCanvas -or -not $listPanel) { return }
+    $keepY = 0
+    try { $keepY = -$listPanel.AutoScrollPosition.Y } catch {}
+    $listPanel.SuspendLayout()
+    $listCanvas.SuspendLayout()
+    # Tops are relative to the inner canvas, never to the AutoScroll panel.
+    $y = 0
+    foreach ($c in $script:listRows) {
+        $c.Left = 0
+        $c.Top = $y
+        $y += $c.Height + 8
+    }
+    $innerH = [Math]::Max(8, $y)
+    Set-ListCanvasHeight $innerH
+    $listCanvas.ResumeLayout($false)
+    $listPanel.ResumeLayout($true)
+    $maxY = [Math]::Max(0, $innerH - $listPanel.ClientSize.Height)
+    if ($keepY -gt $maxY) { $keepY = $maxY }
+    try { $listPanel.AutoScrollPosition = New-Object System.Drawing.Point(0, $keepY) } catch {}
 }
 
 function New-GroupHeader([string]$name, [int]$count, [System.Drawing.Color]$accent) {
@@ -622,14 +852,16 @@ function New-TodoCard {
 
 function Set-ListStatus {
     param([string]$text, [System.Drawing.Color]$color)
-    $listPanel.Controls.Clear(); $script:cards.Clear()
-    if ($script:listRows) { $script:listRows.Clear() }
-    if ($text) {
+    Reset-ListContent
+    if ($text -and $listCanvas) {
         $lbl = New-Object System.Windows.Forms.Label
         $lbl.Text = $text; $lbl.Font = $fontStatus; $lbl.ForeColor = $color; $lbl.BackColor = $cBg
-        $lbl.Location = New-Object System.Drawing.Point(8, 16)
+        $lbl.Location = New-Object System.Drawing.Point(8, 12)
         $lbl.Size = New-Object System.Drawing.Size(340, 40)
-        $listPanel.Controls.Add($lbl)
+        $listCanvas.Controls.Add($lbl)
+        Set-ListCanvasHeight ([Math]::Max(56, $listPanel.ClientSize.Height))
+        try { $listPanel.AutoScrollPosition = New-Object System.Drawing.Point(0, 0) } catch {}
+        $listCanvas.Location = New-Object System.Drawing.Point(0, 0)
     }
 }
 
@@ -664,7 +896,7 @@ function Render-TodoResult {
     }
 
     $built = Build-TodoItems $data
-    $listPanel.Controls.Clear(); $script:cards.Clear(); $script:listRows.Clear()
+    Reset-ListContent
     if ($built.Items.Count -eq 0) {
         Set-ListStatus '未來 7 日內冇未完成待辦' $cMuted
     } else {
@@ -678,11 +910,11 @@ function Render-TodoResult {
                 '逾期' { $cOverdue }; '今日' { $cToday }; '明日' { $cSoon }; '三日內' { $cSoon }; default { $cNormal }
             }
             $gh = New-GroupHeader $g ([int]$grouped[$g].Count) $accent
-            [void]$script:listRows.Add($gh); $listPanel.Controls.Add($gh)
+            [void]$script:listRows.Add($gh); $listCanvas.Controls.Add($gh)
             foreach ($it in $grouped[$g]) {
                 $c = New-TodoCard $it
                 [void]$script:cards.Add($c); [void]$script:listRows.Add($c)
-                $listPanel.Controls.Add($c)
+                $listCanvas.Controls.Add($c)
             }
         }
         Layout-Cards
@@ -747,30 +979,20 @@ $logo.FormBorderStyle = 'None'
 $logo.StartPosition = 'Manual'
 $logo.ShowInTaskbar = $false
 $logo.TopMost = $true
-$logo.AllowTransparency = $true
-$logo.BackColor = $cKey
-$logo.TransparencyKey = $cKey
 $logo.Size = New-Object System.Drawing.Size($LogoSize, $LogoSize)
 $work = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $logo.Location = New-Object System.Drawing.Point(($work.Right - 80), ($work.Bottom - 80))
 $logo.Cursor = [System.Windows.Forms.Cursors]::Hand
-
-$logo.Add_Paint({
-    param($s, $e)
-    $g = $e.Graphics
-    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $g.Clear($cKey)
-    $xf = @{ Sx = 1.0; Sy = 1.0; Oy = 0.0 }
-    if ($script:bouncing) { $xf = Get-BounceXform ([double]$script:bounceT) }
-    $cx = $LogoSize / 2.0
-    $cy = $LogoSize / 2.0
-    $state = $g.Save()
-    $g.TranslateTransform([single]$cx, [single]($cy + $xf.Oy))
-    $g.ScaleTransform([single]$xf.Sx, [single]$xf.Sy)
-    $g.TranslateTransform([single](-$cx), [single](-$cy))
-    Draw-EmberSpirit $g
-    $g.Restore($state)
-})
+if (-not (Test-LayeredLogo)) {
+    $logo.BackColor = $cBg
+    $logo.Add_Paint({
+        param($s, $e)
+        $e.Graphics.Clear($cBg)
+        if ($script:logoFrame) { $e.Graphics.DrawImageUnscaled($script:logoFrame, 0, 0) }
+    })
+}
+$logo.Add_HandleCreated({ Publish-LogoFrame })
+$logo.Add_Shown({ Publish-LogoFrame })
 
 $script:dragStart = $null; $script:dragging = $false
 $logo.Add_MouseDown({
@@ -782,7 +1004,9 @@ $logo.Add_MouseMove({
     if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left -and $null -ne $script:dragStart) {
         $dx = $e.X - $script:dragStart.X; $dy = $e.Y - $script:dragStart.Y
         if ([Math]::Abs($dx) + [Math]::Abs($dy) -gt 4) { $script:dragging = $true }
-        if ($script:dragging) { $logo.Location = New-Object System.Drawing.Point(($logo.Left + $dx), ($logo.Top + $dy)) }
+        if ($script:dragging) {
+            $logo.Location = New-Object System.Drawing.Point(($logo.Left + $dx), ($logo.Top + $dy))
+        }
         return
     }
     $script:hovering = $true
@@ -836,7 +1060,7 @@ $script:animTimer.Add_Tick({
         $script:lookY = [double]$script:lookTY
         $dirty = $true
     }
-    if ($dirty) { $logo.Invalidate() }
+    if ($dirty) { Publish-LogoFrame }
     if ($doToggle) { Toggle-Panel }
     $lookSettled = ([Math]::Abs(([double]$script:lookX) - ([double]$script:lookTX)) -lt 0.03) -and ([Math]::Abs(([double]$script:lookY) - ([double]$script:lookTY)) -lt 0.03)
     if (-not $script:bouncing -and $lookSettled) {
@@ -845,6 +1069,8 @@ $script:animTimer.Add_Tick({
 })
 $logo.Add_FormClosed({
     if ($script:animTimer) { try { $script:animTimer.Stop(); $script:animTimer.Dispose() } catch {} }
+    if ($script:logoFrame) { try { $script:logoFrame.Dispose() } catch {}; $script:logoFrame = $null }
+    if ($script:baseSprite) { try { $script:baseSprite.Dispose() } catch {}; $script:baseSprite = $null }
     if ($script:faceCache) { try { $script:faceCache.Dispose() } catch {}; $script:faceCache = $null }
     if ($script:faceBmp) { try { $script:faceBmp.Dispose() } catch {}; $script:faceBmp = $null }
 })
@@ -935,10 +1161,21 @@ $listPanel = New-Object System.Windows.Forms.Panel
 $listPanel.Location = New-Object System.Drawing.Point(14, $HeaderH)
 $listPanel.Size = New-Object System.Drawing.Size(382, ($PanelH - $HeaderH - $FooterH))
 $listPanel.BackColor = $cBg
+$listPanel.Padding = New-Object System.Windows.Forms.Padding(0)
 $listPanel.AutoScroll = $true
+$listPanel.AutoScrollMargin = New-Object System.Drawing.Size(0, 0)
+$listPanel.AutoScrollMinSize = New-Object System.Drawing.Size(0, 0)
 $listPanel.HorizontalScroll.Enabled = $false
 $listPanel.HorizontalScroll.Visible = $false
 Enable-DoubleBuffer $listPanel
+$listCanvas = New-Object System.Windows.Forms.Panel
+$listCanvas.BackColor = $cBg
+$listCanvas.Margin = New-Object System.Windows.Forms.Padding(0)
+$listCanvas.Padding = New-Object System.Windows.Forms.Padding(0)
+$listCanvas.Location = New-Object System.Drawing.Point(0, 0)
+$listCanvas.Size = New-Object System.Drawing.Size($CardW, 8)
+$listCanvas.AutoScroll = $false
+$listPanel.Controls.Add($listCanvas)
 $panel.Controls.Add($listPanel)
 
 $footer = New-Object System.Windows.Forms.Panel
@@ -1033,7 +1270,10 @@ try {
     })
 } catch {}
 
+[void]$logo.Handle
+Publish-LogoFrame
 $logo.Show()
+Publish-LogoFrame
 Toggle-Panel
 
 if ($Preview) {
@@ -1064,8 +1304,7 @@ if ($Preview) {
         $panel.DrawToBitmap($b2, (New-Object System.Drawing.Rectangle(0, 0, $PanelW, $PanelH)))
         $b2.Save((Join-Path $PSScriptRoot '面板預覽_v30展開.png'), [System.Drawing.Imaging.ImageFormat]::Png)
         $b2.Dispose()
-        $bi = New-Object System.Drawing.Bitmap($LogoSize, $LogoSize)
-        $logo.DrawToBitmap($bi, (New-Object System.Drawing.Rectangle(0, 0, $LogoSize, $LogoSize)))
+        $bi = if ($script:logoFrame) { New-Object System.Drawing.Bitmap($script:logoFrame) } else { New-LogoBitmap }
         $bi.Save((Join-Path $PSScriptRoot '浮動頭_v30.png'), [System.Drawing.Imaging.ImageFormat]::Png)
         $bi.Dispose()
         [System.Windows.Forms.Application]::Exit()

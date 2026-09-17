@@ -1,5 +1,42 @@
 # Changelog — 豆包浮動待辦
 
+## v3.0.2 — 浮動頭 layered blit ＋ 列表滾到頂空白
+
+視覺同行為維持 v3.0 Dusk Ledger。v3.0.1 喺 Windows 實測：指住頭仍然閃；展開後滾到頂會留大片空白。
+
+### 浮動頭仍然閃
+v3.0.1 `SpriteForm` + `TransparencyKey` Magenta + 全窗 `Invalidate` 唔夠：color-key 每次重繪先打成洋紅洞再畫，hover／look-at 仍然閃白／閃洋紅。
+
+**修法**
+- 棄用 Magenta color-key。`LayeredForm` 用 `WS_EX_LAYERED` + `UpdateLayeredWindow`（`ULW_ALPHA`、premultiplied 32bpp）真透明。
+- 靜態臉 cache（`baseSprite`）+ 只重畫瞳孔層；timer 只喺 look／bounce 真係變先 blit，**唔** `Invalidate`、**唔**每像素 MouseMove 重繪。
+- `pptDst = NULL`，位置交俾 `Form.Location`，避免 layered blit 同拖曳搶座標。
+- 跳過 `WM_ERASEBKGND`／空 `OnPaint`，唔同 `SetLayeredWindowAttributes` 混用。
+
+### 滾到頂大片空白
+v3.0.1 對 AutoScroll **同一個** panel 嘅子控件設 `Top`，再設 `AutoScrollMinSize`。滾動中 WinForms 會把 scroll offset 寫入 `Top`；滾回頂時第一張卡 `Top` 仍然好大。
+
+**修法**
+- `listPanel`（AutoScroll）只得一個子控件 `listCanvas`。
+- group／card 嘅 `Top` 相對 canvas（由 0 排），唔再相對 scroll panel。
+- `AutoScrollMinSize = (0, canvas.Height)`：虛擬高度跟內容高度，**唔**用 scrolled 時嘅 `child.Bottom`（會縮 scroll range）。
+- `Layout-Cards` 唔改 `canvas.Location`（交俾 AutoScroll）；重置／狀態列先歸零。
+
+### 點樣測（Windows）
+Linux cloud VM 跑唔到 WinForms。
+
+```powershell
+cd doubao-floating-todo
+powershell -File .\豆包浮動待辦.ps1
+```
+
+1. 滑鼠停喺浮動頭、慢慢郁、離開：冇閃白／閃洋紅／整粒頭跳閃；眼睛仍跟隨。
+2. 左鍵開豆包、拖曳、右鍵 bounce 後 Toggle-Panel 同前。
+3. 打開面板，展開幾張卡，向下滾再滾返最頂：第一個 group／card 貼齊列表頂，冇大片空 canvas。
+4. 重整／複製／離開／`-Preview` 同 v3.0。
+
+---
+
 ## v3.0.1 — 修閃動（卡片 hover ＋ 浮動頭）
 
 視覺同行為維持 v3.0 Dusk Ledger，只修 WinForms 閃白／閃爍。
